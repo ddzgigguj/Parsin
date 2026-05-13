@@ -1,17 +1,16 @@
 """
 Telegram channel parser bot.
-Parses MK match data from t.me/statamk10 and stores in SQLite database.
+Parses MK match data from t.me/statamk10 and stores in JSON file.
 Uses Telethon for Telegram API access.
 """
 
 import asyncio
 import os
-import sys
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
 
-from models import init_db, insert_match, insert_rounds, get_match_count, get_last_message_id
+from models import init_db, save_batch, get_match_count, get_last_message_id
 from parser import parse_message
 
 # Load environment variables
@@ -22,8 +21,8 @@ API_HASH = os.getenv('TELETHON_API_HASH')
 SESSION_NAME = os.getenv('TELETHON_SESSION', 'telegram_session')
 CHANNEL = os.getenv('CHANNEL', 'statamk10')
 
-# Batch size for processing messages
-BATCH_SIZE = 100
+# Save to JSON every N parsed matches
+SAVE_BATCH_SIZE = 500
 # How often to print progress
 PROGRESS_INTERVAL = 1000
 
@@ -34,13 +33,13 @@ async def main():
     print("  MK Match Parser - Telegram Channel Scraper")
     print("=" * 60)
 
-    # Initialize database
+    # Initialize storage
     await init_db()
 
     # Get last processed message ID for resuming
     last_msg_id = await get_last_message_id()
     current_count = await get_match_count()
-    print(f"[INFO] Database has {current_count} matches")
+    print(f"[INFO] Storage has {current_count} matches")
     if last_msg_id:
         print(f"[INFO] Resuming from message ID: {last_msg_id}")
 
@@ -56,20 +55,19 @@ async def main():
         channel = await client.get_entity(CHANNEL)
         print(f"[INFO] Channel found: {channel.title}")
 
-        # Count messages
+        # Counters
         total_messages = 0
         parsed_count = 0
         skipped_count = 0
         error_count = 0
 
-        # Iterate over all messages (oldest first for consistent ordering)
-        # min_id=last_msg_id allows resuming from last processed message
+        # Batch buffer for efficient saving
+        batch = []
+
         print(f"\n[PARSING] Starting to parse messages...")
         print(f"[PARSING] This may take a while for ~300k messages...")
+        print(f"[PARSING] Saving every {SAVE_BATCH_SIZE} matches...")
         print("-" * 60)
-
-        batch_matches = []
-        batch_rounds = []
 
         async for message in client.iter_messages(
             channel,
@@ -89,16 +87,14 @@ async def main():
                     skipped_count += 1
                     continue
 
-                # Extract rounds before inserting
-                rounds = match_data.pop('rounds', [])
-
-                # Insert match
-                match_id = await insert_match(match_data)
-
-                if match_id and rounds:
-                    await insert_rounds(match_id, rounds)
-
+                batch.append(match_data)
                 parsed_count += 1
+
+                # Save batch to JSON periodically
+                if len(batch) >= SAVE_BATCH_SIZE:
+                    added = await save_batch(batch)
+                    print(f"[SAVE] Saved batch: +{added} matches")
+                    batch = []
 
             except Exception as e:
                 error_count += 1
@@ -116,14 +112,29 @@ async def main():
                     f"Errors: {error_count}"
                 )
 
+        # Save remaining batch
+        if batch:
+            added = await save_batch(batch)
+            print(f"[SAVE] Final batch: +{added} matches")
+
     except FloodWaitError as e:
+        # Save what we have before stopping
+        if batch:
+            added = await save_batch(batch)
+            print(f"[SAVE] Emergency save: +{added} matches")
         print(f"\n[FLOOD] Telegram rate limit hit. Wait {e.seconds} seconds.")
         print(f"[FLOOD] Progress saved. Re-run the script to continue.")
 
     except KeyboardInterrupt:
+        # Save on interrupt
+        if batch:
+            added = await save_batch(batch)
+            print(f"[SAVE] Interrupt save: +{added} matches")
         print(f"\n[INTERRUPTED] Stopping gracefully...")
 
     except Exception as e:
+        if batch:
+            await save_batch(batch)
         print(f"\n[FATAL ERROR] {e}")
         import traceback
         traceback.print_exc()
@@ -137,7 +148,7 @@ async def main():
         print(f"  Matches parsed: {parsed_count}")
         print(f"  Messages skipped: {skipped_count}")
         print(f"  Errors: {error_count}")
-        print(f"  Total matches in DB: {final_count}")
+        print(f"  Total matches in JSON: {final_count}")
         print("=" * 60)
 
         await client.disconnect()
